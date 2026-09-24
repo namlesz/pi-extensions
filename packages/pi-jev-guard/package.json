@@ -1,0 +1,27 @@
+{
+  "name": "pi-jev-guard",
+  "version": "0.1.0",
+  "keywords": ["pi-package"],
+  "description": "Fail-closed JEV checks for Pi tool calls",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.87.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}

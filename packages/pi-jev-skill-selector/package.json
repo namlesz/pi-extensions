@@ -1,0 +1,30 @@
+{
+  "name": "pi-jev-skill-selector",
+  "version": "0.1.0",
+  "description": "Pi extension that routes skills with Jev through OpenRouter",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.86.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
