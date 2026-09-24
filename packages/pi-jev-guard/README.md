@@ -1,4 +1,4 @@
-# pi-jev-guard
+# pi-jev-guardian
 
 A Pi extension that evaluates agent `bash` and `powershell` commands with OpenRouter Decisions using `typesafe/jev-1.13`. Other tools (including custom/extension tools) are not checked or blocked by this extension. Commands launched internally by another tool or extension are not visible to this guard.
 
@@ -29,7 +29,7 @@ Try the extension for one invocation from this directory:
 pi --extension ./src/index.ts
 ```
 
-For a persistent personal install, run `pi install /absolute/path/to/pi-extensions/packages/pi-jev-guard`. To add it only to a trusted project, use `pi install --local /absolute/path/to/pi-extensions/packages/pi-jev-guard`. Once published, install only this package with `pi install npm:pi-jev-guard`. Pi loads it alongside configured global extensions and skills; this package does not replace or disable those resource lists. Review extension code before installing it.
+For a persistent personal install, run `pi install /absolute/path/to/pi-extensions/packages/pi-jev-guard`. To add it only to a trusted project, use `pi install --local /absolute/path/to/pi-extensions/packages/pi-jev-guard`. Once published, install only this package with `pi install npm:pi-jev-guardian`. Pi loads it alongside configured global extensions and skills; this package does not replace or disable those resource lists. Review extension code before installing it.
 
 Pi loads TypeScript extensions directly; no build step is needed.
 
