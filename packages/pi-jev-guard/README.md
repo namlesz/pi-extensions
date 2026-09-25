@@ -2,7 +2,7 @@
 
 A Pi extension that evaluates agent `bash` and `powershell` commands with OpenRouter Decisions using `typesafe/jev-1.13`. Other tools (including custom/extension tools) are not checked or blocked by this extension. Commands launched internally by another tool or extension are not visible to this guard.
 
-It checks whether a command is **off-task**, **destructive or hard to reverse**, involves **untrusted input/code**, or needs the user to **approve an external side effect**. Each Noul score is validated as a finite number from 0 to 1. If any score meets the threshold, the user gets **Block** (first/default choice), **Allow once**, or **Always allow**.
+It checks whether a command is **off-task**, **destructive or hard to reverse**, involves **untrusted input/code**, or needs the user to **approve an external side effect**. Each Noul score is validated as a finite number from 0 to 1. If any score meets the threshold, the user gets **Block** (first/default choice), **Allow once**, **Always allow** (when the allowlist is readable), or **Disable guardian for this session** (last). Disabling allows the current and all later shell commands in this Pi session without JEV or manual approval, even if OpenRouter becomes available again. The choice persists across extension reloads, but not into a new session. While awaiting a choice, Pi shows a warning notification and the optional herdr integration reports the agent as blocked; neither requires herdr to be installed.
 
 An **Always allow** choice saves the exact command and shell globally to `~/.pi/agent/jev-guard-allow.json`. You can also edit that JSON file directly, for example:
 

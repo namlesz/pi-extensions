@@ -30,20 +30,35 @@ export default function jevGuard(
   fetcher: typeof fetch = fetch,
   allowPath = join(homedir(), ".pi", "agent", "jev-guard-allow.json"),
 ): void {
+  let disabledSessionId: string | undefined;
+  const restore = (ctx: ExtensionContext) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    disabledSessionId = ctx.sessionManager.getEntries().some((entry) =>
+      entry.type === "custom" && entry.customType === "jev-guardian-disabled" && (entry.data as { sessionId?: string } | undefined)?.sessionId === sessionId
+    ) ? sessionId : undefined;
+  };
+  pi.on("session_start", (_event, ctx) => restore(ctx));
+  pi.on("session_tree", (_event, ctx) => restore(ctx));
+  const disable = (ctx: ExtensionContext) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    pi.appendEntry("jev-guardian-disabled", { sessionId });
+    disabledSessionId = sessionId;
+  };
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "bash" && event.toolName !== "powershell") return;
     const command = event.input.command;
     if (typeof command !== "string") return { block: true, reason: "Blocked: shell command is missing." };
+    if (disabledSessionId === ctx.sessionManager.getSessionId()) return;
     try {
       const allowed = readAllowed(allowPath);
       if (isAllowed(command, allowed, event.toolName)) return;
     } catch {
-      return decision(ctx, event, "Cannot read the command allowlist. Choose whether to proceed.");
+      return decision(pi, ctx, event, "Cannot read the command allowlist. Choose whether to proceed.", disable);
     }
 
     const apiKey = process.env.OPENROUTER_API_KEY?.trim();
     if (!apiKey) {
-      return decision(ctx, event, "JEV is unavailable: OPENROUTER_API_KEY is not set. Choose whether to proceed.", allowPath);
+      return decision(pi, ctx, event, "JEV is unavailable: OPENROUTER_API_KEY is not set. Choose whether to proceed.", disable, allowPath);
     }
 
     const config = readConfig();
@@ -52,12 +67,12 @@ export default function jevGuard(
       const state = makeState(latestUserGoal(ctx), event);
       answers = await askJev(apiKey, state, config.timeoutMs, fetcher, ctx.signal);
     } catch {
-      return decision(ctx, event, "JEV could not assess this call (request failure, timeout, or invalid response). Choose whether to proceed.", allowPath);
+      return decision(pi, ctx, event, "JEV could not assess this call (request failure, timeout, or invalid response). Choose whether to proceed.", disable, allowPath);
     }
     const flagged = CHECK_NAMES.filter((name) => answers[name].noul >= config.threshold);
     if (flagged.length === 0) return;
     const summary = flagged.map((name) => `${label(name)} (${Math.round(answers[name].noul * 100)}%)`).join(", ");
-    return decision(ctx, event, `JEV flagged: ${summary}. Choose whether to proceed.`, allowPath, answers, flagged);
+    return decision(pi, ctx, event, `JEV flagged: ${summary}. Choose whether to proceed.`, disable, allowPath, answers, flagged);
   });
 }
 
@@ -164,9 +179,11 @@ function makeState(goal: string, event: ToolCallEvent): string {
 }
 
 async function decision(
+  pi: ExtensionAPI,
   ctx: ExtensionContext,
   event: ToolCallEvent,
   reason: string,
+  disable: (ctx: ExtensionContext) => void,
   allowPath?: string,
   answers?: JevAnswers,
   flagged?: CheckName[],
@@ -177,10 +194,16 @@ async function decision(
   const clippedArgs = args.length > DISPLAY_ARGS_CHARS ? `${args.slice(0, DISPLAY_ARGS_CHARS)}…` : args;
   const title = `${reason}${raised}\nTool: ${event.toolName}\nArguments: ${clippedArgs}`;
 
+  pi.events.emit("herdr:blocked", { active: true, label: "JEV guardian: command approval needed" });
   try {
-    const choices = allowPath ? ["Block", "Allow once", "Always allow"] : ["Block", "Allow once"];
+    ctx.ui.notify("JEV guardian: command approval needed", "warning");
+    const choices = allowPath ? ["Block", "Allow once", "Always allow", "Disable guardian for this session"] : ["Block", "Allow once", "Disable guardian for this session"];
     const choice = await ctx.ui.select(title, choices, ctx.signal ? { signal: ctx.signal } : undefined);
     if (choice === "Allow once") return;
+    if (choice === "Disable guardian for this session") {
+      disable(ctx);
+      return;
+    }
     if (choice === "Always allow" && allowPath && (event.toolName === "bash" || event.toolName === "powershell")) {
       await allowCommand(allowPath, event.toolName, event.input.command as string, ctx.signal);
       return;
@@ -188,6 +211,8 @@ async function decision(
     return { block: true, reason: "Blocked by user, cancellation, or missing approval." };
   } catch {
     return { block: true, reason: "Blocked because approval could not be obtained or saved." };
+  } finally {
+    pi.events.emit("herdr:blocked", { active: false });
   }
 }
 

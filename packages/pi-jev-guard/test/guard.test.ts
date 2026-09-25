@@ -8,7 +8,8 @@ import jevGuard, { readConfig } from "../src/index.ts";
 import { CHECK_NAMES, DECISIONS_URL, JEV_MODEL, redactSecrets } from "../src/jev.ts";
 
 type Handler = (event: ToolCallEvent, ctx: ExtensionContext) => Promise<ToolCallEventResult | void>;
-type Choice = "Block" | "Allow once" | "Always allow" | undefined;
+type Choice = "Block" | "Allow once" | "Always allow" | "Disable guardian for this session" | undefined;
+type TestSession = { id: string; entries: { type: "custom"; customType: string; data: unknown }[]; branchVisible?: boolean; failWrite?: boolean; start?: (ctx: ExtensionContext) => void; tree?: (ctx: ExtensionContext) => void };
 const testDir = mkdtempSync(join(tmpdir(), "jev-guard-"));
 after(() => rmSync(testDir, { recursive: true, force: true }));
 let nextPath = 0;
@@ -20,38 +21,54 @@ const event = (input: Record<string, unknown> = { command: "pwd" }): ToolCallEve
   input,
 });
 
-function extension(fetcher: typeof fetch, allowPath = join(testDir, `${nextPath++}.json`)): Handler {
+function extension(fetcher: typeof fetch, allowPath = join(testDir, `${nextPath++}.json`), events: { active: boolean; label?: string }[] = [], session: TestSession = { id: "test-session", entries: [] }): Handler {
   let handler: Handler | undefined;
   jevGuard({
-    on: (_name: "tool_call", callback: Handler) => {
-      handler = callback;
+    on: (name: string, callback: Handler | ((_event: unknown, ctx: ExtensionContext) => void)) => {
+      if (name === "tool_call") handler = callback as Handler;
+      if (name === "session_start") session.start = (ctx) => (callback as (_event: unknown, ctx: ExtensionContext) => void)({}, ctx);
+      if (name === "session_tree") session.tree = (ctx) => (callback as (_event: unknown, ctx: ExtensionContext) => void)({}, ctx);
       return () => {};
     },
+    appendEntry: (customType: string, data: unknown) => {
+      if (session.failWrite) throw new Error("session write failed");
+      session.entries.push({ type: "custom", customType, data });
+    },
+    events: { emit: (name: string, data: { active: boolean; label?: string }) => {
+      assert.equal(name, "herdr:blocked");
+      events.push(data);
+    } },
   } as unknown as ExtensionAPI, fetcher, allowPath);
   assert.ok(handler);
   return handler;
 }
-function context(options: { goal?: string; hasUI?: boolean; choices?: Choice[] } = {}): ExtensionContext & { selections: string[] } {
+function context(options: { goal?: string; hasUI?: boolean; choices?: Choice[]; onSelect?: () => void; session?: TestSession } = {}): ExtensionContext & { selections: string[]; notifications: string[] } {
   const selections: string[] = [];
+  const notifications: string[] = [];
   const choices = [...(options.choices ?? ["Block"])];
   return {
     hasUI: options.hasUI ?? true,
     signal: undefined,
     sessionManager: {
-      getBranch: () => [{
-        type: "message",
-        message: { role: "user", content: [{ type: "text", text: options.goal ?? "Fix the current task." }] },
-      }],
+      getSessionId: () => options.session?.id ?? "test-session",
+      getEntries: () => options.session?.entries ?? [],
+      getBranch: () => [
+        { type: "message", message: { role: "user", content: [{ type: "text", text: options.goal ?? "Fix the current task." }] } },
+        ...(options.session?.branchVisible === false ? [] : options.session?.entries ?? []),
+      ],
     },
     ui: {
+      notify: (message: string) => { notifications.push(message); },
       select: async (title: string, choicesShown: string[]) => {
         selections.push(title);
-        assert.deepEqual(choicesShown, title.startsWith("Cannot read the command allowlist") ? ["Block", "Allow once"] : ["Block", "Allow once", "Always allow"]);
+        options.onSelect?.();
+        assert.deepEqual(choicesShown, title.startsWith("Cannot read the command allowlist") ? ["Block", "Allow once", "Disable guardian for this session"] : ["Block", "Allow once", "Always allow", "Disable guardian for this session"]);
         return choices.shift();
       },
     },
     selections,
-  } as unknown as ExtensionContext & { selections: string[] };
+    notifications,
+  } as unknown as ExtensionContext & { selections: string[]; notifications: string[] };
 }
 
 function response(scores: Partial<Record<(typeof CHECK_NAMES)[number], number>> = {}, status = 200): Response {
@@ -147,6 +164,79 @@ test("missing key uses one manual choice; no UI blocks without calling the API",
   });
 });
 
+test("approval alerts Pi and herdr only while waiting for user", async () => {
+  const events: { active: boolean; label?: string }[] = [];
+  const handler = extension(async () => response(), join(testDir, `${nextPath++}.json`), events);
+  await withApiKey(undefined, async () => {
+    const ctx = context({ choices: ["Allow once"], onSelect: () => {
+      assert.deepEqual(events, [{ active: true, label: "JEV guardian: command approval needed" }]);
+    } });
+    assert.equal(await handler(event(), ctx), undefined);
+    assert.deepEqual(ctx.notifications, ["JEV guardian: command approval needed"]);
+    assert.deepEqual(events, [
+      { active: true, label: "JEV guardian: command approval needed" },
+      { active: false },
+    ]);
+    events.length = 0;
+    assert.ok(await handler(event(), context({ choices: [undefined] })));
+    assert.deepEqual(events, [
+      { active: true, label: "JEV guardian: command approval needed" },
+      { active: false },
+    ]);
+    events.length = 0;
+    assert.ok(await handler(event(), context({ hasUI: false })));
+    assert.deepEqual(events, []);
+  });
+});
+
+test("disable choice bypasses checks only in this session and survives extension reload", async () => {
+  const session: TestSession = { id: "first", entries: [] };
+  let calls = 0;
+  const fetcher: typeof fetch = async () => { calls++; return response({ destructive: 0.9 }); };
+  const path = join(testDir, `${nextPath++}.json`);
+  const handler = extension(fetcher, path, [], session);
+  await withApiKey("test-key", async () => {
+    const first = context({ session, choices: ["Disable guardian for this session"] });
+    assert.equal(await handler(event({ command: "unsafe" }), first), undefined);
+    assert.deepEqual(session.entries, [{ type: "custom", customType: "jev-guardian-disabled", data: { sessionId: "first" } }]);
+    assert.equal(calls, 1);
+    const skipped = context({ session, hasUI: false });
+    assert.equal(await handler(event({ command: "another command" }), skipped), undefined);
+    assert.equal(skipped.selections.length, 0);
+    assert.equal(calls, 1);
+    const reloaded = extension(fetcher, path, [], session);
+    session.start?.(context({ session }));
+    assert.equal(await reloaded(event({ command: "after reload" }), context({ session, hasUI: false })), undefined);
+    assert.equal(calls, 1);
+    session.branchVisible = false;
+    session.tree?.(context({ session }));
+    assert.equal(await reloaded(event({ command: "earlier branch" }), context({ session, hasUI: false })), undefined);
+    assert.equal(calls, 1);
+    session.branchVisible = true; // Fork from the path containing the disable marker.
+    session.id = "second"; // A Pi fork copies entries but assigns a new session ID.
+    assert.equal(session.entries.length, 1);
+    session.start?.(context({ session }));
+    const next = context({ session, choices: ["Block"] });
+    assert.ok(await reloaded(event({ command: "new session" }), next));
+    assert.equal(next.selections.length, 1);
+    assert.equal(calls, 2);
+  });
+});
+
+test("disable with unavailable API fails closed if session state cannot be saved", async () => {
+  const session: TestSession = { id: "broken", entries: [], failWrite: true };
+  const handler = extension(async () => { throw new Error("should not fetch"); }, undefined, [], session);
+  await withApiKey(undefined, async () => {
+    assert.deepEqual(await handler(event(), context({ session, choices: ["Disable guardian for this session"] })), {
+      block: true, reason: "Blocked because approval could not be obtained or saved.",
+    });
+    assert.deepEqual(session.entries, []);
+    session.failWrite = false;
+    const next = context({ session, choices: ["Block"] });
+    assert.ok(await handler(event(), next));
+    assert.equal(next.selections.length, 1);
+  });
+});
 test("invalid response and timeout require manual approval", async () => {
   const invalid = extension(async () => response({ destructive: 1.01 }));
   await withApiKey("test-key", async () => {
