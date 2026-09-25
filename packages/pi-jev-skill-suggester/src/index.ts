@@ -80,7 +80,7 @@ async function savedLimit(): Promise<number | undefined> {
   }
 }
 
-export default function skillSelector(pi: ExtensionAPI): void {
+export default function skillSuggester(pi: ExtensionAPI): void {
   pi.registerCommand("skill-threshold", {
     description: "Show or set the persistent skill suggestion threshold (0–100%)",
     handler: async (args, ctx) => {
