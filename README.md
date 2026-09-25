@@ -4,7 +4,7 @@ Independent Pi packages in one npm workspace. Each directory under `packages/` h
 
 | Package | Description |
 | --- | --- |
-| [`pi-jev-skill-selector`](packages/pi-jev-skill-selector/) | Suggest potentially useful skills with Jev via OpenRouter; never hides skills |
+| [`pi-jev-skill-suggester`](packages/pi-jev-skill-suggester/) | Suggest potentially useful skills with Jev via OpenRouter; never hides skills |
 | [`pi-jev-guardian`](packages/pi-jev-guard/) | Guard shell commands with Jev and manual approval |
 
 ```sh
@@ -15,4 +15,4 @@ npm run typecheck
 
 To add an extension, create `packages/<package-name>/` with its own `package.json` and `pi.extensions` pointing to its entry file. npm will discover it through `workspaces` automatically.
 
-Preview a package with `npm pack --dry-run --workspace pi-jev-guardian` (or `pi-jev-skill-selector`). Publish each separately with `npm publish --workspace <package-name>` only when ready. After publishing, install one with `pi install npm:<package-name>`.
+Preview a package with `npm pack --dry-run --workspace pi-jev-guardian` (or `pi-jev-skill-suggester`). Publish each separately with `npm publish --workspace <package-name>` only when ready. After publishing, install one with `pi install npm:<package-name>`.
