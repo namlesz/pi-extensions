@@ -1,8 +1,23 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, before, test } from "node:test";
 import type { Skill } from "@earendil-works/pi-coding-agent";
-import skillSelector, { buildQuestions, readConfig, selectSkills } from "../src/index.ts";
+import skillSelector, { buildQuestions, readConfig, suggestSkills } from "../src/index.ts";
 import { askJev, DECISIONS_URL, JEV_MODEL } from "../src/jev.ts";
+
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+let agentDir: string;
+before(async () => {
+  agentDir = await mkdtemp(join(tmpdir(), "jev-selector-test-"));
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+});
+after(async () => {
+  if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  await rm(agentDir, { recursive: true, force: true });
+});
 
 const skill = (name: string, disableModelInvocation = false): Skill => ({
   name,
@@ -16,49 +31,37 @@ const skill = (name: string, disableModelInvocation = false): Skill => ({
 const response = (answers: unknown, status = 200) =>
   new Response(JSON.stringify({ answers }), { status, headers: { "Content-Type": "application/json" } });
 
-test("selection applies threshold, ordering, deduplication, and three-skill limit", () => {
+test("suggestions apply threshold, ordering, deduplication, and configured limit", () => {
   const skills = [skill("a"), skill("b"), skill("a"), skill("c"), skill("d")];
-  const selection = selectSkills(
+  const suggestions = suggestSkills(
     skills,
     {
-      skill_0: { type: "noul", noul: 0.6 },
+      skill_0: { type: "noul", noul: 0.8 },
       skill_1: { type: "noul", noul: 0.95 },
       skill_2: { type: "noul", noul: 0.9 },
-      skill_3: { type: "noul", noul: 0.8 },
+      skill_3: { type: "noul", noul: 0.85 },
       skill_4: { type: "noul", noul: 0.7 },
     },
-    0.6,
+    0.8, 2,
   );
-  assert.equal(selection.primary?.name, "b");
-  assert.deepEqual(selection.supporting.map(({ name }) => name), ["a", "c"]);
-  assert.deepEqual(selection.skills.map(({ name }) => name), ["b", "a", "c"]);
-  assert.deepEqual(
-    selection.ranked.map(({ skill, probability }) => [skill.name, probability]),
-    [["b", 0.95], ["a", 0.9], ["c", 0.8]],
-  );
+  assert.deepEqual(suggestions.map(({ skill, probability }) => [skill.name, probability]), [["b", 0.95], ["a", 0.9]]);
 });
 
-test("selection may be empty", () => {
-  assert.deepEqual(
-    selectSkills([skill("a")], { skill_0: { type: "noul", noul: 0.59 } }, 0.6).skills,
-    [],
-  );
+test("suggestions may be empty", () => {
+  assert.deepEqual(suggestSkills([skill("a")], { skill_0: { type: "noul", noul: 0.79 } }, 0.8), []);
 });
 
 test("configuration accepts valid values and defaults invalid values", () => {
   assert.deepEqual(
-    readConfig({
-      PI_SKILL_SELECTOR_THRESHOLD: "0",
-      PI_SKILL_SELECTOR_TIMEOUT_MS: "25",
-      PI_SKILL_SELECTOR_ALWAYS_VISIBLE: " pi-subagents, docs,pi-subagents ",
-    }),
-    { threshold: 0, timeoutMs: 25, alwaysVisible: ["pi-subagents", "docs"], enabled: true },
+    readConfig({ PI_SKILL_SELECTOR_THRESHOLD: "0", PI_SKILL_SELECTOR_TIMEOUT_MS: "25" }),
+    { threshold: 0, timeoutMs: 25, enabled: true },
   );
   assert.deepEqual(
     readConfig({ PI_SKILL_SELECTOR_THRESHOLD: "2", PI_SKILL_SELECTOR_TIMEOUT_MS: "1.5" }),
-    { threshold: 0.6, timeoutMs: 3000, alwaysVisible: ["pi-subagents"], enabled: true },
+    { threshold: 0.7, timeoutMs: 3000, enabled: true },
   );
-  assert.deepEqual(readConfig({ PI_SKILL_SELECTOR_ALWAYS_VISIBLE: "" }).alwaysVisible, []);
+  assert.equal(readConfig({ PI_SELECTOR_THRESHOLD: "0.75", PI_SKILL_SELECTOR_THRESHOLD: "0.9" }).threshold, 0.75);
+  assert.equal(readConfig({ PI_SELECTOR_THRESHOLD: "bad", PI_SKILL_SELECTOR_THRESHOLD: "0.9" }).threshold, 0.9);
   assert.equal(readConfig({ PI_SKILL_SELECTOR_ENABLED: "0" }).enabled, false);
 });
 
@@ -107,32 +110,38 @@ test("Jev does not start a request when the parent signal is already aborted", a
   await assert.rejects(askJev("secret", "prompt", buildQuestions([skill("a")]), 100, fetcher, controller.signal), /cancelled/);
   assert.equal(called, false);
 });
-test("extension filters candidates and adds mandatory instruction only for a non-empty success", async () => {
+test("extension suggests optional skills without hiding any and clears stale suggestions", async () => {
   const originalKey = process.env.OPENROUTER_API_KEY;
   const originalFetch = globalThis.fetch;
   process.env.OPENROUTER_API_KEY = "secret";
-  globalThis.fetch = async () => response({ skill_0: { type: "noul", noul: 0.8 }, skill_1: { type: "noul", noul: 0.7 } });
+  let requestBody: any;
+  globalThis.fetch = async (_url, init) => {
+    requestBody = JSON.parse(String(init?.body));
+    return response({ skill_0: { type: "noul", noul: 0.9 }, skill_1: { type: "noul", noul: 0.85 } });
+  };
   try {
     const statuses: Array<string | undefined> = [];
     const entries: Array<{ customType: string; data: any }> = [];
     const handler = captureHandler(entries);
-    const options = { skills: [skill("chosen"), skill("supporting"), skill("explicit", true)], sections: {} as Record<string, string> };
+    const all = [skill("chosen"), skill("helpful"), skill("explicit", true)];
+    const options = { skills: all, sections: {} as Record<string, string> };
     await handler({ prompt: "task", systemPromptOptions: options }, context("tui", statuses));
-    assert.deepEqual(options.skills.map(({ name }) => name), ["chosen", "supporting"]);
-    assert.match(options.sections.jev_skill_selector, /must follow them/);
-    assert.equal(statuses.at(-1), "jev-skill-selector: (80%) chosen [primary], (70%) supporting [supporting]");
+    assert.equal(options.skills, all);
+    assert.deepEqual(Object.keys(requestBody.questions), ["skill_0", "skill_1"]);
+    assert.match(requestBody.questions.skill_0.instructions, /specific benefit/);
+    assert.match(options.sections.jev_skill_selector, /Skills that may be useful: chosen, helpful/);
+    assert.match(options.sections.jev_skill_selector, /optional hint, not a requirement/);
+    assert.doesNotMatch(options.sections.jev_skill_selector, /must follow/i);
+    assert.equal(statuses.at(-1), "skill-suggestions: chosen, helpful");
     assert.deepEqual(entries.at(-1), {
       customType: "jev_skill_selector",
-      data: {
-        status: "success",
-        selected: [{ name: "chosen", probability: 0.8 }, { name: "supporting", probability: 0.7 }],
-        alwaysVisible: [],
-      },
+      data: { status: "success", suggested: [{ name: "chosen", probability: 0.9 }, { name: "helpful", probability: 0.85 }] },
     });
     globalThis.fetch = async () => response({ skill_0: { type: "noul", noul: 0.1 }, skill_1: { type: "noul", noul: 0.1 } });
-    await handler({ prompt: "task", systemPromptOptions: options }, context());
-    assert.deepEqual(options.skills, []);
+    await handler({ prompt: "task", systemPromptOptions: options }, context("tui", statuses));
+    assert.equal(options.skills, all);
     assert.equal(options.sections.jev_skill_selector, undefined);
+    assert.equal(statuses.at(-1), undefined);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY;
@@ -140,36 +149,17 @@ test("extension filters candidates and adds mandatory instruction only for a non
   }
 });
 
-test("always-visible skills bypass Jev, stay optional, and sit outside the selection limit", async () => {
-  const originalKey = process.env.OPENROUTER_API_KEY;
-  const originalAlways = process.env.PI_SKILL_SELECTOR_ALWAYS_VISIBLE;
+test("no eligible skills produces no request or suggestion", async () => {
   const originalFetch = globalThis.fetch;
-  process.env.OPENROUTER_API_KEY = "secret";
-  process.env.PI_SKILL_SELECTOR_ALWAYS_VISIBLE = "pi-subagents";
-  let requestBody: any;
-  globalThis.fetch = async (_url, init) => {
-    requestBody = JSON.parse(String(init?.body));
-    return response({ skill_0: { type: "noul", noul: 0.1 } });
-  };
+  globalThis.fetch = async () => { throw new Error("should not call Jev"); };
   try {
-    const statuses: Array<string | undefined> = [];
-    const handler = captureHandler();
-    const options = {
-      skills: [skill("routed"), skill("pi-subagents")],
-      sections: {} as Record<string, string>,
-    };
-    await handler({ prompt: "task", systemPromptOptions: options }, context("tui", statuses));
-    assert.deepEqual(Object.keys(requestBody.questions), ["skill_0"]);
-    assert.deepEqual(options.skills.map(({ name }) => name), ["pi-subagents"]);
-    assert.match(options.sections.jev_skill_selector, /Always-visible optional skills: pi-subagents/);
-    assert.doesNotMatch(options.sections.jev_skill_selector, /Mandatory skills/);
-    assert.equal(statuses.at(-1), undefined);
+    const all = [skill("explicit", true)];
+    const options = { skills: all, sections: { jev_skill_selector: "stale" } as Record<string, string> };
+    await captureHandler()({ prompt: "task", systemPromptOptions: options }, context());
+    assert.equal(options.skills, all);
+    assert.equal(options.sections.jev_skill_selector, undefined);
   } finally {
     globalThis.fetch = originalFetch;
-    if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY;
-    else process.env.OPENROUTER_API_KEY = originalKey;
-    if (originalAlways === undefined) delete process.env.PI_SKILL_SELECTOR_ALWAYS_VISIBLE;
-    else process.env.PI_SKILL_SELECTOR_ALWAYS_VISIBLE = originalAlways;
   }
 });
 
@@ -262,11 +252,66 @@ test("routing can be disabled explicitly without sending prompts to Jev", async 
   }
 });
 
+test("commands persist threshold and limit across extension instances and reset them", async () => {
+  const originalKey = process.env.OPENROUTER_API_KEY;
+  const originalFetch = globalThis.fetch;
+  const originalThreshold = process.env.PI_SELECTOR_THRESHOLD;
+  const originalLegacyThreshold = process.env.PI_SKILL_SELECTOR_THRESHOLD;
+  delete process.env.PI_SELECTOR_THRESHOLD;
+  delete process.env.PI_SKILL_SELECTOR_THRESHOLD;
+  process.env.OPENROUTER_API_KEY = "secret";
+  globalThis.fetch = async () => response(Object.fromEntries([0.69, 0.7, 0.8, 0.9].map((noul, i) => [`skill_${i}`, { type: "noul", noul }])));
+  const notices: string[] = [];
+  const ui = { notify: (message: string) => { notices.push(message); } };
+  const commands: Record<string, (args: string, ctx: any) => Promise<void>> = {};
+  skillSelector({
+    on: () => {},
+    registerCommand: (name: string, command: any) => { commands[name] = command.handler; },
+  } as any);
+  try {
+    await commands["skill-threshold"]("70", { ui });
+    await commands["skill-limit"]("3", { ui });
+    assert.equal(await readFile(join(agentDir, "jev-skill-selector-threshold"), "utf8"), "0.7");
+    assert.equal(await readFile(join(agentDir, "jev-skill-selector-limit"), "utf8"), "3");
+    const handler = captureHandler();
+    const options = { skills: [skill("a"), skill("b"), skill("c"), skill("d")], sections: {} as Record<string, string> };
+    await handler({ prompt: "task", systemPromptOptions: options }, context());
+    assert.match(options.sections.jev_skill_selector, /Skills that may be useful: d, c, b\./);
+    await commands["skill-limit"]("1", { ui });
+    await captureHandler()({ prompt: "task", systemPromptOptions: options }, context());
+    assert.match(options.sections.jev_skill_selector, /Skills that may be useful: d\./);
+    await commands["skill-threshold"]("101", { ui });
+    await commands["skill-limit"]("-1", { ui });
+    assert.match(notices.at(-1)!, /Usage:/);
+    assert.equal(await readFile(join(agentDir, "jev-skill-selector-limit"), "utf8"), "1");
+    await commands["skill-limit"]("0", { ui });
+    globalThis.fetch = async () => { throw new Error("should not call Jev"); };
+    await captureHandler()({ prompt: "task", systemPromptOptions: options }, context());
+    assert.equal(options.sections.jev_skill_selector, undefined);
+    await commands["skill-threshold"]("reset", { ui });
+    await commands["skill-limit"]("reset", { ui });
+    assert.match(notices.at(-2)!, /70%/);
+    assert.match(notices.at(-1)!, /3$/);
+    globalThis.fetch = async () => response(Object.fromEntries([0.69, 0.7, 0.8, 0.9].map((noul, i) => [`skill_${i}`, { type: "noul", noul }])));
+    await captureHandler()({ prompt: "task", systemPromptOptions: options }, context());
+    assert.match(options.sections.jev_skill_selector, /Skills that may be useful: d, c, b\./);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalThreshold === undefined) delete process.env.PI_SELECTOR_THRESHOLD;
+    else process.env.PI_SELECTOR_THRESHOLD = originalThreshold;
+    if (originalLegacyThreshold === undefined) delete process.env.PI_SKILL_SELECTOR_THRESHOLD;
+    else process.env.PI_SKILL_SELECTOR_THRESHOLD = originalLegacyThreshold;
+    if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = originalKey;
+  }
+});
+
 function captureHandler(entries: Array<{ customType: string; data: any }> = []): (event: any, ctx: any) => Promise<void> {
   let handler: ((event: any, ctx: any) => Promise<void>) | undefined;
   skillSelector({
     on: (_name: string, value: typeof handler) => { handler = value; },
     appendEntry: (customType: string, data: any) => { entries.push({ customType, data }); },
+    registerCommand: () => {},
   } as any);
   assert.ok(handler);
   return handler;

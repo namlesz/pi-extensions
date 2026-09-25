@@ -1,3 +1,6 @@
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI, Skill } from "@earendil-works/pi-coding-agent";
 import { askJev, type JevAnswers, type JevQuestions } from "./jev.ts";
 
@@ -8,12 +11,6 @@ export interface RankedSkill {
   probability: number;
 }
 
-export interface Selection {
-  primary?: Skill;
-  supporting: Skill[];
-  skills: Skill[];
-  ranked: RankedSkill[];
-}
 
 export function buildQuestions(skills: Skill[]): JevQuestions {
   return Object.fromEntries(
@@ -21,80 +18,152 @@ export function buildQuestions(skills: Skill[]): JevQuestions {
       `skill_${index}`,
       {
         type: "noul" as const,
-        instructions: `Is the skill "${skill.name}" required to complete the current task correctly?`,
+        instructions: `Would the skill "${skill.name}" offer a specific benefit for the current task, even if it is not required?`,
         criteria: {
-          false: `The task can be completed correctly without ${skill.name}.`,
-          true: `${skill.name} is required: ${skill.description}`,
+          false: `The skill ${skill.name} does not meaningfully help with this task.`,
+          true: `The skill ${skill.name} is relevant to a concrete step in this task: ${skill.description}`,
         },
       },
     ]),
   );
 }
 
-export function selectSkills(skills: Skill[], answers: JevAnswers, threshold: number): Selection {
+export function suggestSkills(skills: Skill[], answers: JevAnswers, threshold: number, limit = 3): RankedSkill[] {
   const seen = new Set<string>();
-  const ranked = skills
+  return skills
     .map((skill, index) => ({ skill, probability: answers[`skill_${index}`].noul }))
     .filter(({ probability }) => probability >= threshold)
     .sort((a, b) => b.probability - a.probability)
     .filter(({ skill }) => !seen.has(skill.name) && Boolean(seen.add(skill.name)))
-    .slice(0, 3);
-  const selected = ranked.map(({ skill }) => skill);
-
-  return { primary: selected[0], supporting: selected.slice(1), skills: selected, ranked };
+    .slice(0, limit);
 }
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env): {
   threshold: number;
   timeoutMs: number;
-  alwaysVisible: string[];
   enabled: boolean;
 } {
   return {
-    threshold: numberInRange(env.PI_SKILL_SELECTOR_THRESHOLD, 0, 1, 0.6),
+    threshold: numberInRange(env.PI_SELECTOR_THRESHOLD, 0, 1, numberInRange(env.PI_SKILL_SELECTOR_THRESHOLD, 0, 1, 0.7)),
     timeoutMs: positiveInteger(env.PI_SKILL_SELECTOR_TIMEOUT_MS, 3000),
-    alwaysVisible: [...new Set((env.PI_SKILL_SELECTOR_ALWAYS_VISIBLE ?? "pi-subagents").split(",").map((name) => name.trim()).filter(Boolean))],
     enabled: env.PI_SKILL_SELECTOR_ENABLED !== "0",
   };
 }
 
-export default function skillSelector(pi: ExtensionAPI): void {
-  pi.on("before_agent_start", async (event, ctx) => {
-    const allSkills = [...event.systemPromptOptions.skills];
-    const { threshold, timeoutMs, alwaysVisible: alwaysVisibleNames, enabled } = readConfig();
-    const alwaysVisibleSet = new Set(alwaysVisibleNames);
-    const alwaysVisible = allSkills.filter((skill) => alwaysVisibleSet.has(skill.name));
-    const candidates = allSkills.filter(
-      (skill) => !skill.disableModelInvocation && !alwaysVisibleSet.has(skill.name),
-    );
-    delete event.systemPromptOptions.sections[ROUTER_SECTION];
+function thresholdFile(): string {
+  return join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "jev-skill-selector-threshold");
+}
 
+async function savedThreshold(): Promise<number | undefined> {
+  try {
+    const value = (await readFile(thresholdFile(), "utf8")).trim();
+    const parsed = Number(value);
+    return value !== "" && Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function limitFile(): string {
+  return join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "jev-skill-selector-limit");
+}
+
+async function savedLimit(): Promise<number | undefined> {
+  try {
+    const value = (await readFile(limitFile(), "utf8")).trim();
+    const parsed = Number(value);
+    return value !== "" && Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+export default function skillSelector(pi: ExtensionAPI): void {
+  pi.registerCommand("skill-threshold", {
+    description: "Show or set the persistent skill suggestion threshold (0–100%)",
+    handler: async (args, ctx) => {
+      const value = args.trim();
+      if (value && value !== "reset" && (!/^(?:\d+(?:\.\d+)?)$/.test(value) || Number(value) > 100)) {
+        ctx.ui.notify("Usage: /skill-threshold [0–100 | reset]", "warning");
+        return;
+      }
+      try {
+        if (value === "reset") {
+          try { await unlink(thresholdFile()); } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+        } else if (value) {
+          const path = thresholdFile();
+          await mkdir(dirname(path), { recursive: true });
+          await writeFile(path, String(Number(value) / 100), "utf8");
+        }
+        const threshold = await savedThreshold() ?? readConfig().threshold;
+        ctx.ui.notify(`Skill suggestion threshold: ${threshold * 100}%`, "info");
+      } catch (error) {
+        ctx.ui.notify(`Could not update skill threshold: ${errorMessage(error)}`, "error");
+      }
+    },
+  });
+  pi.registerCommand("skill-limit", {
+    description: "Show or set the persistent maximum number of skill suggestions",
+    handler: async (args, ctx) => {
+      const value = args.trim();
+      if (value && value !== "reset" && (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)))) {
+        ctx.ui.notify("Usage: /skill-limit [non-negative integer | reset]", "warning");
+        return;
+      }
+      try {
+        if (value === "reset") {
+          try { await unlink(limitFile()); } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+        } else if (value) {
+          const path = limitFile();
+          await mkdir(dirname(path), { recursive: true });
+          await writeFile(path, value, "utf8");
+        }
+        ctx.ui.notify(`Skill suggestion limit: ${await savedLimit() ?? 3}`, "info");
+      } catch (error) {
+        ctx.ui.notify(`Could not update skill limit: ${errorMessage(error)}`, "error");
+      }
+    },
+  });
+  pi.on("before_agent_start", async (event, ctx) => {
+    const { timeoutMs, enabled, threshold: defaultThreshold } = readConfig();
+    const candidates = event.systemPromptOptions.skills.filter((skill) => !skill.disableModelInvocation);
+    delete event.systemPromptOptions.sections[ROUTER_SECTION];
     if (!enabled || event.images?.length) {
       pi.appendEntry(ROUTER_SECTION, { status: "skipped", reason: enabled ? "images" : "disabled_by_user" });
       if (ctx.mode === "tui") ctx.ui.setStatus(ROUTER_SECTION, undefined);
       return;
     }
+    let threshold: number;
+    let limit: number;
+    try {
+      threshold = await savedThreshold() ?? defaultThreshold;
+      limit = await savedLimit() ?? 3;
+    } catch (error) {
+      pi.appendEntry(ROUTER_SECTION, { status: "failure", error: errorMessage(error) });
+      warn(ctx, `Skill suggestions unavailable (${errorMessage(error)})`);
+      return;
+    }
 
-    if (candidates.length === 0) {
-      event.systemPromptOptions.skills = alwaysVisible;
-      setRouterSection(event.systemPromptOptions.sections, [], alwaysVisible);
-      pi.appendEntry(ROUTER_SECTION, {
-        status: "skipped",
-        reason: "no_candidates",
-        alwaysVisible: alwaysVisible.map(({ name }) => name),
-      });
-      if (ctx.mode === "tui") ctx.ui.setStatus(ROUTER_SECTION, statusText([]));
+    if (candidates.length === 0 || limit === 0) {
+      pi.appendEntry(ROUTER_SECTION, { status: "skipped", reason: limit === 0 ? "zero_limit" : "no_candidates" });
+      if (ctx.mode === "tui") ctx.ui.setStatus(ROUTER_SECTION, undefined);
       return;
     }
 
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
       pi.appendEntry(ROUTER_SECTION, { status: "disabled", reason: "missing_api_key" });
-      warn(ctx, "Skill routing disabled: OPENROUTER_API_KEY is missing");
+      warn(ctx, "Skill suggestions disabled: OPENROUTER_API_KEY is missing");
       return;
     }
 
-    if (ctx.mode === "tui") ctx.ui.setStatus(ROUTER_SECTION, "routing skills…");
+    if (ctx.mode === "tui") ctx.ui.setStatus(ROUTER_SECTION, "checking skills…");
 
     try {
       const previous = ctx.sessionManager.getBranch()
@@ -117,47 +186,30 @@ export default function skillSelector(pi: ExtensionAPI): void {
         fetch,
         ctx.signal,
       );
-      const selection = selectSkills(candidates, answers, threshold);
-      event.systemPromptOptions.skills = [...selection.skills, ...alwaysVisible];
-      setRouterSection(event.systemPromptOptions.sections, selection.skills, alwaysVisible);
+      const suggestions = suggestSkills(candidates, answers, threshold, limit);
+      setSuggestionSection(event.systemPromptOptions.sections, suggestions);
       pi.appendEntry(ROUTER_SECTION, {
         status: "success",
-        selected: selection.ranked.map(({ skill, probability }) => ({ name: skill.name, probability })),
-        alwaysVisible: alwaysVisible.map(({ name }) => name),
+        suggested: suggestions.map(({ skill, probability }) => ({ name: skill.name, probability })),
       });
       if (ctx.mode === "tui") {
-        ctx.ui.setStatus(ROUTER_SECTION, statusText(selection.ranked));
+        ctx.ui.setStatus(ROUTER_SECTION, statusText(suggestions));
       }
     } catch (error) {
-      event.systemPromptOptions.skills = allSkills;
       pi.appendEntry(ROUTER_SECTION, { status: "failure", error: errorMessage(error) });
-      warn(ctx, `Skill routing failed; using all skills (${errorMessage(error)})`);
+      warn(ctx, `Skill suggestions unavailable (${errorMessage(error)})`);
     }
   });
 }
 
-function setRouterSection(sections: Record<string, string>, selected: Skill[], alwaysVisible: Skill[]): void {
-  const lines: string[] = [];
-  if (selected.length > 0) {
-    lines.push(
-      `Mandatory skills selected for the current task: ${selected.map((skill) => skill.name).join(", ")}. You must follow them. Read each selected SKILL.md unless its instructions are already present in the conversation context.`,
-    );
-  }
-  if (alwaysVisible.length > 0) {
-    lines.push(
-      `Always-visible optional skills: ${alwaysVisible.map((skill) => skill.name).join(", ")}. Decide whether to use them for the current task.`,
-    );
-  }
-  if (lines.length > 0) sections[ROUTER_SECTION] = lines.join("\n");
+function setSuggestionSection(sections: Record<string, string>, suggestions: RankedSkill[]): void {
+  if (suggestions.length === 0) return;
+  sections[ROUTER_SECTION] = `Skills that may be useful: ${suggestions.map(({ skill }) => skill.name).join(", ")}. Consider reading their SKILL.md if relevant. This is an optional hint, not a requirement; follow the user's instructions and choose any available skill independently.`;
 }
 
-function statusText(selected: RankedSkill[]): string | undefined {
-  if (selected.length === 0) return undefined;
-  return `jev-skill-selector: ${selected
-    .map(({ skill, probability }, index) =>
-      `(${Math.round(probability * 100)}%) ${skill.name} [${index === 0 ? "primary" : "supporting"}]`,
-    )
-    .join(", ")}`;
+function statusText(suggestions: RankedSkill[]): string | undefined {
+  if (suggestions.length === 0) return undefined;
+  return `skill-suggestions: ${suggestions.map(({ skill }) => skill.name).join(", ")}`;
 }
 
 function numberInRange(value: string | undefined, min: number, max: number, fallback: number): number {
