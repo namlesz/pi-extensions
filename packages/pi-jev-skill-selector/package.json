@@ -1,6 +1,6 @@
 {
   "name": "pi-jev-skill-selector",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension that routes skills with Jev through OpenRouter",
   "type": "module",
   "keywords": [
