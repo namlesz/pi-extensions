@@ -197,7 +197,7 @@ async function decision(
   pi.events.emit("herdr:blocked", { active: true, label: "JEV guardian: command approval needed" });
   try {
     ctx.ui.notify("JEV guardian: command approval needed", "warning");
-    const choices = allowPath ? ["Block", "Allow once", "Always allow", "Disable guardian for this session"] : ["Block", "Allow once", "Disable guardian for this session"];
+    const choices = allowPath ? ["Allow once", "Block", "Always allow", "Disable guardian for this session"] : ["Allow once", "Block", "Disable guardian for this session"];
     const choice = await ctx.ui.select(title, choices, ctx.signal ? { signal: ctx.signal } : undefined);
     if (choice === "Allow once") return;
     if (choice === "Disable guardian for this session") {

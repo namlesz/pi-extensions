@@ -62,7 +62,7 @@ function context(options: { goal?: string; hasUI?: boolean; choices?: Choice[]; 
       select: async (title: string, choicesShown: string[]) => {
         selections.push(title);
         options.onSelect?.();
-        assert.deepEqual(choicesShown, title.startsWith("Cannot read the command allowlist") ? ["Block", "Allow once", "Disable guardian for this session"] : ["Block", "Allow once", "Always allow", "Disable guardian for this session"]);
+        assert.deepEqual(choicesShown, title.startsWith("Cannot read the command allowlist") ? ["Allow once", "Block", "Disable guardian for this session"] : ["Allow once", "Block", "Always allow", "Disable guardian for this session"]);
         return choices.shift();
       },
     },
