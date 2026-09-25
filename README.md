@@ -4,7 +4,7 @@ Independent Pi packages in one npm workspace. Each directory under `packages/` h
 
 | Package | Description |
 | --- | --- |
-| [`pi-jev-skill-selector`](packages/pi-jev-skill-selector/) | Route skills with Jev via OpenRouter |
+| [`pi-jev-skill-selector`](packages/pi-jev-skill-selector/) | Suggest potentially useful skills with Jev via OpenRouter; never hides skills |
 | [`pi-jev-guardian`](packages/pi-jev-guard/) | Guard shell commands with Jev and manual approval |
 
 ```sh
