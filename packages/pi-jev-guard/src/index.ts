@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
@@ -25,11 +25,46 @@ export function readConfig(env: Record<string, string | undefined> = process.env
   };
 }
 
+function savedThreshold(path: string): number | undefined {
+  try {
+    const value = readFileSync(path, "utf8").trim();
+    const parsed = Number(value);
+    return value !== "" && Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
 export default function jevGuard(
   pi: ExtensionAPI,
   fetcher: typeof fetch = fetch,
   allowPath = join(homedir(), ".pi", "agent", "jev-guard-allow.json"),
+  thresholdPath = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "jev-guardian-threshold"),
 ): void {
+  pi.registerCommand("jev-guardian-threshold", {
+    description: "Show or set the global JEV guardian threshold (0–100%)",
+    handler: async (args, ctx) => {
+      const value = args.trim();
+      if (value && value !== "reset" && (!/^\d+(?:\.\d+)?$/.test(value) || Number(value) > 100)) {
+        ctx.ui.notify("Usage: /jev-guardian-threshold [0–100 | reset]", "warning");
+        return;
+      }
+      try {
+        if (value === "reset") {
+          try { unlinkSync(thresholdPath); } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+        } else if (value) {
+          mkdirSync(dirname(thresholdPath), { recursive: true });
+          writeFileSync(thresholdPath, String(Number(value) / 100), "utf8");
+        }
+        ctx.ui.notify(`JEV guardian threshold: ${(savedThreshold(thresholdPath) ?? readConfig().threshold) * 100}%`, "info");
+      } catch (error) {
+        ctx.ui.notify(`Could not update JEV guardian threshold: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
   let disabledSessionId: string | undefined;
   const restore = (ctx: ExtensionContext) => {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -69,7 +104,11 @@ export default function jevGuard(
     } catch {
       return decision(pi, ctx, event, "JEV could not assess this call (request failure, timeout, or invalid response). Choose whether to proceed.", disable, allowPath);
     }
-    const flagged = CHECK_NAMES.filter((name) => answers[name].noul >= config.threshold);
+    let threshold: number;
+    try { threshold = savedThreshold(thresholdPath) ?? config.threshold; } catch {
+      return decision(pi, ctx, event, "Cannot read the JEV guardian threshold. Choose whether to proceed.", disable, allowPath);
+    }
+    const flagged = CHECK_NAMES.filter((name) => answers[name].noul >= threshold);
     if (flagged.length === 0) return;
     const summary = flagged.map((name) => `${label(name)} (${Math.round(answers[name].noul * 100)}%)`).join(", ");
     return decision(pi, ctx, event, `JEV flagged: ${summary}. Choose whether to proceed.`, disable, allowPath, answers, flagged);
@@ -197,7 +236,7 @@ async function decision(
   pi.events.emit("herdr:blocked", { active: true, label: "JEV guardian: command approval needed" });
   try {
     ctx.ui.notify("JEV guardian: command approval needed", "warning");
-    const choices = allowPath ? ["Block", "Allow once", "Always allow", "Disable guardian for this session"] : ["Block", "Allow once", "Disable guardian for this session"];
+    const choices = allowPath ? ["Allow once", "Block", "Always allow", "Disable guardian for this session"] : ["Allow once", "Block", "Disable guardian for this session"];
     const choice = await ctx.ui.select(title, choices, ctx.signal ? { signal: ctx.signal } : undefined);
     if (choice === "Allow once") return;
     if (choice === "Disable guardian for this session") {

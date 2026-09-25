@@ -21,7 +21,7 @@ const event = (input: Record<string, unknown> = { command: "pwd" }): ToolCallEve
   input,
 });
 
-function extension(fetcher: typeof fetch, allowPath = join(testDir, `${nextPath++}.json`), events: { active: boolean; label?: string }[] = [], session: TestSession = { id: "test-session", entries: [] }): Handler {
+function extension(fetcher: typeof fetch, allowPath = join(testDir, `${nextPath++}.json`), events: { active: boolean; label?: string }[] = [], session: TestSession = { id: "test-session", entries: [] }, thresholdPath = join(testDir, `${nextPath++}.threshold`), commands: Record<string, (args: string, ctx: ExtensionContext) => Promise<void>> = {}): Handler {
   let handler: Handler | undefined;
   jevGuard({
     on: (name: string, callback: Handler | ((_event: unknown, ctx: ExtensionContext) => void)) => {
@@ -30,6 +30,7 @@ function extension(fetcher: typeof fetch, allowPath = join(testDir, `${nextPath+
       if (name === "session_tree") session.tree = (ctx) => (callback as (_event: unknown, ctx: ExtensionContext) => void)({}, ctx);
       return () => {};
     },
+    registerCommand: (name: string, command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => { commands[name] = command.handler; },
     appendEntry: (customType: string, data: unknown) => {
       if (session.failWrite) throw new Error("session write failed");
       session.entries.push({ type: "custom", customType, data });
@@ -38,7 +39,7 @@ function extension(fetcher: typeof fetch, allowPath = join(testDir, `${nextPath+
       assert.equal(name, "herdr:blocked");
       events.push(data);
     } },
-  } as unknown as ExtensionAPI, fetcher, allowPath);
+  } as unknown as ExtensionAPI, fetcher, allowPath, thresholdPath);
   assert.ok(handler);
   return handler;
 }
@@ -62,7 +63,7 @@ function context(options: { goal?: string; hasUI?: boolean; choices?: Choice[]; 
       select: async (title: string, choicesShown: string[]) => {
         selections.push(title);
         options.onSelect?.();
-        assert.deepEqual(choicesShown, title.startsWith("Cannot read the command allowlist") ? ["Block", "Allow once", "Disable guardian for this session"] : ["Block", "Allow once", "Always allow", "Disable guardian for this session"]);
+        assert.deepEqual(choicesShown, title.startsWith("Cannot read the command allowlist") ? ["Allow once", "Block", "Disable guardian for this session"] : ["Allow once", "Block", "Always allow", "Disable guardian for this session"]);
         return choices.shift();
       },
     },
@@ -97,6 +98,30 @@ test("configuration validates threshold and bounds timeout", () => {
   assert.deepEqual(readConfig({ PI_JEV_GUARD_THRESHOLD: "2", PI_JEV_GUARD_TIMEOUT_MS: "1.5" }), {
     threshold: 0.5,
     timeoutMs: 3_000,
+  });
+});
+
+test("global threshold command persists, validates and resets", async () => {
+  const path = join(testDir, "global-threshold");
+  const commands: Record<string, (args: string, ctx: ExtensionContext) => Promise<void>> = {};
+  const fetcher: typeof fetch = async () => response({ destructive: 0.6 });
+  const handler = extension(fetcher, undefined, [], undefined, path, commands);
+  const ctx = context();
+  const command = commands["jev-guardian-threshold"]!;
+  await command("70", ctx);
+  assert.equal(readFileSync(path, "utf8"), "0.7");
+  await withApiKey("test-key", async () => {
+    assert.equal(await handler(event(), context()), undefined);
+    const reloaded = extension(fetcher, undefined, [], undefined, path);
+    assert.equal(await reloaded(event(), context()), undefined);
+  });
+  await command("101", ctx);
+  assert.equal(readFileSync(path, "utf8"), "0.7");
+  assert.equal(ctx.notifications.at(-1), "Usage: /jev-guardian-threshold [0–100 | reset]");
+  await command("reset", ctx);
+  assert.equal(ctx.notifications.at(-1), "JEV guardian threshold: 50%");
+  await withApiKey("test-key", async () => {
+    assert.ok(await handler(event(), context({ choices: ["Block"] })));
   });
 });
 
