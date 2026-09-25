@@ -215,25 +215,45 @@ test("manual entries are literal; invalid lists cannot create or save permanent 
   assert.equal(readFileSync(path, "utf8"), "not json");
 });
 
-
-test("explicit patterns match whole commands across lines; UI approval remains exact", async () => {
+test("patterns approve only simple commands and chains whose every segment is approved", async () => {
   const path = join(testDir, "patterns.json");
-  writeFileSync(path, JSON.stringify({ bashPatterns: ["npm *", "echo * end"], powershellPatterns: ["Get-*"] }));
-  const handler = extension(async () => response({ destructive: 0.9 }), path);
-  await withApiKey(undefined, async () => {
-    for (const command of ["npm test", "npm test; rm -rf x", "echo /tmp/a\nmore end"]) {
-      assert.equal(await handler(event({ command }), context({ hasUI: false })), undefined);
+  writeFileSync(path, JSON.stringify({ bash: ["git status"], bashPatterns: ["npm *", "echo * end"], powershellPatterns: ["Get-*", "Write-Host *"] }));
+  const sent: string[] = [];
+  const handler = extension(async (_url, init) => {
+    const state = JSON.parse(JSON.parse(String(init?.body)).state) as { arguments: { command: string } };
+    sent.push(state.arguments.command);
+    return response({ destructive: 0.9 });
+  }, path);
+  await withApiKey("test-key", async () => {
+    for (const command of ["npm test", "git status; npm test && echo done end", "npm test\nnpm run lint", "npm test || git status"]) {
+      assert.equal(await handler(event({ command }), context({ hasUI: false })), undefined, command);
     }
-    assert.equal(await handler({ ...event({ command: "Get-Item" }), toolName: "powershell" }, context({ hasUI: false })), undefined);
-    for (const command of ["npm", "NPM test", "echo x end trailing", "Get-Item"]) {
-      assert.ok(await handler(event({ command }), context({ hasUI: false })));
+    assert.equal(await handler({ ...event({ command: "Get-Item; Write-Host done" }), toolName: "powershell" }, context({ hasUI: false })), undefined);
+    assert.equal(sent.length, 0);
+
+    for (const command of [
+      "npm test; rm -rf x", "npm test && curl example.com", "npm test\nrm -rf x",
+      "npm test | sh", "npm test & rm -rf x", "npm test $(rm -rf x)",
+      "npm test `rm -rf x`", "npm test > out", "npm test # comment\nrm -rf x",
+      "npm test;", "npm test;;git status", "npm test; git status &&",
+      "NPM test", "echo x end trailing", "echo /tmp/a\nmore end",
+    ]) {
+      const ctx = context({ choices: ["Block"] });
+      assert.ok(await handler(event({ command }), ctx), command);
+      assert.match(ctx.selections[0]!, /JEV flagged/);
+      assert.equal(sent.at(-1), command);
     }
+    for (const command of ["Get-Item; Remove-Item x", "Get-Item | Remove-Item x", "Get-Item; Write-Host $HOME"]) {
+      assert.ok(await handler({ ...event({ command }), toolName: "powershell" }, context({ choices: ["Block"] })), command);
+    }
+    assert.equal(sent.length, 18);
+
     const ctx = context({ choices: ["Always allow"] });
     assert.equal(await handler(event({ command: "echo *" }), ctx), undefined);
+    assert.equal(await handler(event({ command: "echo *" }), context({ hasUI: false })), undefined);
     assert.ok(await handler(event({ command: "echo danger" }), context({ hasUI: false })));
   });
-  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).bash, ["echo *"]);
-  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).bashPatterns, ["npm *", "echo * end"]);
+  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).bash, ["git status", "echo *"]);
 });
 
 test("concurrent permanent approvals wait for the lock and retain both commands", async () => {

@@ -36,7 +36,7 @@ export default function jevGuard(
     if (typeof command !== "string") return { block: true, reason: "Blocked: shell command is missing." };
     try {
       const allowed = readAllowed(allowPath);
-      if (allowed[event.toolName].includes(command) || allowed[`${event.toolName}Patterns`].some((pattern) => matchesPattern(command, pattern))) return;
+      if (isAllowed(command, allowed, event.toolName)) return;
     } catch {
       return decision(ctx, event, "Cannot read the command allowlist. Choose whether to proceed.");
     }
@@ -64,6 +64,18 @@ export default function jevGuard(
 type Shell = "bash" | "powershell";
 type Allowlist = Record<Shell | `${Shell}Patterns`, string[]>;
 const EMPTY_ALLOWLIST = (): Allowlist => ({ bash: [], powershell: [], bashPatterns: [], powershellPatterns: [] });
+
+function isAllowed(command: string, allowed: Allowlist, tool: Shell): boolean {
+  if (allowed[tool].includes(command)) return true;
+  // Only recognize plain words and simple chains; anything shell-dependent is assessed as a whole by JEV.
+  const parts = command.split(/;|&&|\|\||\r?\n/);
+  return parts.every((part) => {
+    const simple = part.trim();
+    return /^[A-Za-z0-9_./:@%+=, \t-]+$/.test(simple) && (
+      allowed[tool].includes(simple) || allowed[`${tool}Patterns`].some((pattern) => matchesPattern(simple, pattern))
+    );
+  });
+}
 
 function matchesPattern(command: string, pattern: string): boolean {
   if (!pattern.includes("*")) return command === pattern;
