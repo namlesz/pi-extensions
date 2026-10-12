@@ -125,14 +125,14 @@ test("global threshold command persists, validates and resets", async () => {
   });
 });
 
-test("request uses JEV, sends the four checks, and redacts secret-like fields", async () => {
+test("request uses JEV, sends only the three safety checks, and redacts secret-like fields", async () => {
   let sentState: Record<string, unknown> | undefined;
   const fetcher: typeof fetch = async (url, init) => {
     assert.equal(url, DECISIONS_URL);
     assert.equal(new Headers(init?.headers).get("authorization"), "Bearer test-key");
     const body = JSON.parse(String(init?.body)) as { model: string; questions: object; state: string };
     assert.equal(body.model, JEV_MODEL);
-    assert.deepEqual(Object.keys(body.questions), ["off_task", "destructive", "untrusted_input", "ask_first"]);
+    assert.deepEqual(Object.keys(body.questions), ["destructive", "untrusted_input", "ask_first"]);
     sentState = JSON.parse(body.state) as Record<string, unknown>;
     return response();
   };
