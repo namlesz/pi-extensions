@@ -1,0 +1,29 @@
+{
+  "name": "pi-self-complaint",
+  "version": "0.1.0",
+  "description": "After each Pi run, ask the agent what annoyed it and log concrete complaints to the project's docs",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "type": "module",
+  "files": ["src", "README.md"],
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.87.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
