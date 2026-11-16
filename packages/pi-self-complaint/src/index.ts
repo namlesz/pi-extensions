@@ -9,11 +9,37 @@ import {
   lastAssistantText,
   parseAnswer,
 } from "./complaint.ts";
+import {
+  BACKGROUND_TERMINAL,
+  SUBAGENT_ASYNC_COMPLETE,
+  SUBAGENT_ASYNC_STARTED,
+  startedBackgroundTaskId,
+  subagentRunId,
+  terminalTaskId,
+} from "./background.ts";
 import { defaultStatePath, isEnabled, writeEnabled } from "./state.ts";
 
 export default function selfComplaint(pi: ExtensionAPI, statePath = defaultStatePath()): void {
   // True while the one extra "did anything annoy you?" request of the current run is pending.
   let asked = false;
+
+  // Background runs that will start a new run when they finish. The parent settles while they are still working,
+  // so asking then would ask before the work is done. Ids are removed when the matching completion arrives.
+  const pendingBackground = new Set<string>();
+  const busUnsubscribes = [
+    pi.events?.on(SUBAGENT_ASYNC_STARTED, (payload) => {
+      const id = subagentRunId(payload);
+      if (id) pendingBackground.add(id);
+    }),
+    pi.events?.on(SUBAGENT_ASYNC_COMPLETE, (payload) => {
+      const id = subagentRunId(payload);
+      if (id) pendingBackground.delete(id);
+    }),
+    pi.events?.on(BACKGROUND_TERMINAL, (payload) => {
+      const id = terminalTaskId(payload);
+      if (id) pendingBackground.delete(id);
+    }),
+  ];
 
   pi.on("session_start", () => {
     asked = false;
@@ -21,6 +47,19 @@ export default function selfComplaint(pi: ExtensionAPI, statePath = defaultState
   pi.on("session_tree", () => {
     asked = false;
   });
+  pi.on("session_shutdown", () => {
+    for (const unsubscribe of busUnsubscribes) unsubscribe?.();
+    pendingBackground.clear();
+  });
+
+  // Tools that start a background shell or agent task return its snapshot in details.task. Without the bus there is
+  // no completion event to remove the id again, so nothing is tracked.
+  if (pi.events) {
+    pi.on("tool_result", (event) => {
+      const id = startedBackgroundTaskId(event.details);
+      if (id) pendingBackground.add(id);
+    });
+  }
 
   pi.registerCommand("complaints", {
     description: "Turn agent self-complaints on, off, or show status for this project (on | off | status)",
@@ -54,6 +93,10 @@ export default function selfComplaint(pi: ExtensionAPI, statePath = defaultState
         ctx.ui.notify(`Agent complaints disabled: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
       if (!enabled) return;
+
+      // Background work is still running, so this settle is only a pause. Its completion starts a new run, and
+      // the question is asked there, once the work is actually done.
+      if (pendingBackground.size > 0) return;
 
       // First boundary of the run: ask once and request exactly one more model response.
       asked = true;

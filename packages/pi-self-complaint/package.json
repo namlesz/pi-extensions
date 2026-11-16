@@ -1,6 +1,6 @@
 {
   "name": "pi-self-complaint",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "After each Pi run, ask the agent what annoyed it and log concrete complaints to the project's docs",
   "keywords": ["pi-package"],
   "license": "MIT",

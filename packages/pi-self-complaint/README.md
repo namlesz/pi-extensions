@@ -34,7 +34,7 @@ The setting is per project directory. It is stored in `~/.pi/agent/self-complain
 - 2026-11-16 20:40 · session 01a1e0d4 · #my-project · pnpm gate keeps running after the rules step fails
 ```
 
-Aborted and errored runs are not asked. Replies that are neither `NO` nor a `COMPLAINT:` line are ignored and logged nothing. The question is asked once per run, so the extension cannot loop.
+Aborted and errored runs are not asked. Runs that only pause while background work is still going are not asked either: with `pi-background-tasks` a task that will wake the agent (`notifyOnCompletion` and `triggerOnCompletion`), and with `pi-subagents` an async subagent run, count as pending until their completion arrives. The question then comes in the run that the result starts. Without those extensions nothing is tracked and each run is asked as before. Replies that are neither `NO` nor a `COMPLAINT:` line are ignored and logged nothing. The question is asked once per run, so the extension cannot loop.
 
 ## Privacy
 
