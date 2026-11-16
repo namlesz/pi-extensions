@@ -16,6 +16,7 @@ import {
   sanitize,
 } from "../src/complaint.ts";
 import { isEnabled, readStates, writeEnabled } from "../src/state.ts";
+import { BACKGROUND_TERMINAL, SUBAGENT_ASYNC_COMPLETE, SUBAGENT_ASYNC_STARTED } from "../src/background.ts";
 
 const testDir = mkdtempSync(join(tmpdir(), "self-complaint-"));
 after(() => rmSync(testDir, { recursive: true, force: true }));
@@ -23,11 +24,25 @@ after(() => rmSync(testDir, { recursive: true, force: true }));
 type Outcome = "completed" | "aborted" | "error";
 type Handler = (event: any, ctx: ExtensionContext) => unknown;
 
-/** One Pi session in one project directory; `statePath` is shared across sessions to model persistence. */
-function harness(cwd: string, statePath: string) {
+/**
+ * One Pi session in one project directory; `statePath` is shared across sessions to model persistence.
+ * `events: false` models a Pi host without the shared `pi.events` bus.
+ */
+function harness(cwd: string, statePath: string, options: { events?: boolean } = {}) {
   const handlers = new Map<string, Handler[]>();
+  const busHandlers = new Map<string, ((payload: unknown) => void)[]>();
   const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
   const notes: { message: string; level: string }[] = [];
+
+  const events = {
+    on: (name: string, handler: (payload: unknown) => void) => {
+      busHandlers.set(name, [...(busHandlers.get(name) ?? []), handler]);
+      return () => busHandlers.set(name, (busHandlers.get(name) ?? []).filter((other) => other !== handler));
+    },
+    emit: (name: string, payload: unknown) => {
+      for (const handler of busHandlers.get(name) ?? []) handler(payload);
+    },
+  };
 
   const pi = {
     on: (name: string, handler: Handler) => {
@@ -37,6 +52,7 @@ function harness(cwd: string, statePath: string) {
     registerCommand: (name: string, command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => {
       commands.set(name, command.handler);
     },
+    ...(options.events === false ? {} : { events }),
   } as unknown as ExtensionAPI;
 
   const ctx = {
@@ -70,9 +86,18 @@ function harness(cwd: string, statePath: string) {
       },
     });
   const command = (args: string) => commands.get("complaints")!(args, ctx);
+  const publish = (name: string, payload: unknown) => events.emit(name, payload);
 
-  return { emit, settle, command, notes };
+  return { emit, settle, command, notes, publish };
 }
+
+const bgTask = (id: string, overrides: Record<string, unknown> = {}) => ({
+  id,
+  status: "running",
+  notifyOnCompletion: true,
+  triggerOnCompletion: true,
+  ...overrides,
+});
 
 test("parseAnswer accepts NO and COMPLAINT lines and rejects anything else", () => {
   assert.deepEqual(parseAnswer("NO"), { type: "none" });
@@ -243,4 +268,81 @@ test("corrupt state: command reports an error and the hook stays silent", async 
 
   assert.equal(await h.settle("completed", "COMPLAINT: should not ask"), undefined);
   assert.equal(h.notes.at(-1)!.level, "error");
+});
+
+test("a background subagent run blocks the question until it completes", async () => {
+  const cwd = join(testDir, "project-bg-1");
+  const h = harness(cwd, join(testDir, "state-12", "self-complaint.json"));
+  await h.command("on");
+
+  h.publish(SUBAGENT_ASYNC_STARTED, { id: "run-1" });
+  assert.equal(await h.settle("completed"), undefined);
+
+  h.publish(SUBAGENT_ASYNC_COMPLETE, { id: "run-1" });
+  assert.equal((await h.settle("completed") as { continue: boolean }).continue, true);
+});
+
+test("a background shell task blocks the question until its terminal event", async () => {
+  const h = harness(join(testDir, "project-bg-2"), join(testDir, "state-13", "self-complaint.json"));
+  await h.command("on");
+
+  await h.emit("tool_result", { type: "tool_result", toolName: "bg_run", details: { task: bgTask("task-1") } });
+  assert.equal(await h.settle("completed"), undefined);
+
+  h.publish(BACKGROUND_TERMINAL, { schema_version: 1, task: { id: "task-1", status: "completed" } });
+  assert.equal((await h.settle("completed") as { continue: boolean }).continue, true);
+});
+
+test("only the matching background task is released", async () => {
+  const h = harness(join(testDir, "project-bg-3"), join(testDir, "state-14", "self-complaint.json"));
+  await h.command("on");
+
+  await h.emit("tool_result", { type: "tool_result", toolName: "bg_run", details: { task: bgTask("task-a") } });
+  await h.emit("tool_result", { type: "tool_result", toolName: "bg_run", details: { task: bgTask("task-b") } });
+  h.publish(BACKGROUND_TERMINAL, { schema_version: 1, task: { id: "task-a" } });
+  assert.equal(await h.settle("completed"), undefined);
+
+  h.publish(BACKGROUND_TERMINAL, { schema_version: 1, task: { id: "task-b" } });
+  assert.equal((await h.settle("completed") as { continue: boolean }).continue, true);
+});
+
+test("background tasks that do not wake the parent, or are not running, do not block", async () => {
+  const h = harness(join(testDir, "project-bg-4"), join(testDir, "state-15", "self-complaint.json"));
+  await h.command("on");
+
+  await h.emit("tool_result", {
+    type: "tool_result",
+    toolName: "bg_run",
+    details: { task: bgTask("quiet", { triggerOnCompletion: false }) },
+  });
+  await h.emit("tool_result", {
+    type: "tool_result",
+    toolName: "bg_status",
+    details: { task: bgTask("done", { status: "completed" }) },
+  });
+  assert.equal((await h.settle("completed") as { continue: boolean }).continue, true);
+});
+
+test("the question is asked in the run that the background completion starts", async () => {
+  const cwd = join(testDir, "project-bg-5");
+  const h = harness(cwd, join(testDir, "state-16", "self-complaint.json"));
+  await h.command("on");
+
+  // Run 1: the parent launches work and ends its turn to wait. No question yet.
+  await h.emit("tool_result", { type: "tool_result", toolName: "bg_run", details: { task: bgTask("task-1") } });
+  assert.equal(await h.settle("completed"), undefined);
+
+  // Run 2: the completion arrives and starts a new run. This is the one that asks.
+  h.publish(BACKGROUND_TERMINAL, { schema_version: 1, task: { id: "task-1", status: "completed" } });
+  assert.equal((await h.settle("completed") as { continue: boolean }).continue, true);
+  assert.equal(await h.settle("completed", "COMPLAINT: the wait had no progress output"), undefined);
+  assert.match(readFileSync(join(cwd, LOG_RELATIVE_PATH), "utf8"), /the wait had no progress output/);
+});
+
+test("without the pi.events bus the question is asked at every settle, as before", async () => {
+  const h = harness(join(testDir, "project-bg-6"), join(testDir, "state-17", "self-complaint.json"), { events: false });
+  await h.command("on");
+
+  await h.emit("tool_result", { type: "tool_result", toolName: "bg_run", details: { task: bgTask("task-1") } });
+  assert.equal((await h.settle("completed") as { continue: boolean }).continue, true);
 });
